@@ -2,7 +2,8 @@ use crate::{
     error::RuntimeError,
     export::{Context, Export, FuncPointer},
     import::IsExport,
-    types::{FuncSig, NativeWasmType, Type, WasmExternType},
+    structures::TypedIndex,
+    types::{FuncIndex, FuncSig, NativeWasmType, Type, WasmExternType},
     vm::{self, Ctx},
 };
 use std::{
@@ -15,6 +16,70 @@ use std::{
     ptr::{self, NonNull},
     sync::Arc,
 };
+
+pub const STACK_TRACE_SIZE: usize = 32;
+pub type StackTrace = [usize; STACK_TRACE_SIZE];
+
+#[repr(C)]
+pub struct WasmTrapWrapper {
+    pub info: WasmTrapInfo,
+    pub stack_trace: Option<StackTrace>,
+}
+
+impl fmt::Display for WasmTrapWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        //write!(f, "{}\nstack trace: {:?}", self.info, self.stack_trace)
+        write!(f, "{}", self.info)
+    }
+}
+
+impl Default for WasmTrapWrapper {
+    fn default() -> Self {
+        Self {
+            info: WasmTrapInfo::Unknown,
+            stack_trace: None,
+        }
+    }
+}
+
+fn print_stack_trace(ctx: &Ctx, trap: &WasmTrapWrapper) {
+    if let Some(stack_trace) = trap.stack_trace {
+        println!("wasm backtrace:");
+
+        let module = unsafe { &*ctx.module };
+        let info = &module.info;
+
+        // Get the end address of module functions, so we can discard unknown stack trace locations
+        let code_end_addr = module.runnable_module.get_code_end_ptr().unwrap();
+
+        let local_backing = unsafe { &*ctx.local_backing };
+
+        for (depth, loc) in stack_trace.iter().copied().enumerate() {
+            if 0 == loc {
+                break;
+            }
+
+            let best_fn = local_backing
+                .local_functions
+                .iter()
+                .map(|(fi, f)| (fi, *f as usize))
+                .filter(|(_, faddr)| loc >= *faddr && loc < code_end_addr)
+                .min_by_key(|(_, faddr)| loc - *faddr);
+
+            if let Some((idx, _)) = best_fn {
+                let import_len = info.imported_functions.len();
+                let func_index = FuncIndex::new(idx.index() + import_len);
+                if let Some(name) = info.function_names.get(&func_index) {
+                    println!("{:>4}: {}", depth, rustc_demangle::demangle(name));
+                } else {
+                    println!("{:>4}: unknown local function", depth);
+                }
+            } else {
+                println!("{:>4}: ???", depth);
+            }
+        }
+    }
+}
 
 #[repr(C)]
 pub enum WasmTrapInfo {
@@ -59,7 +124,7 @@ pub type Invoke = unsafe extern "C" fn(
     NonNull<vm::Func>,
     *const u64,
     *mut u64,
-    *mut WasmTrapInfo,
+    *mut WasmTrapWrapper,
     *mut Option<Box<dyn Any>>,
     Option<NonNull<c_void>>,
 ) -> bool;
@@ -282,7 +347,7 @@ impl<A: WasmExternType> WasmTypeList for (A,) {
         let (a,) = self;
         let args = [a.to_native().to_binary()];
         let mut rets = Rets::empty_ret_array();
-        let mut trap = WasmTrapInfo::Unknown;
+        let mut trap = WasmTrapWrapper::default();
         let mut user_error = None;
 
         if (wasm.invoke)(
@@ -300,6 +365,7 @@ impl<A: WasmExternType> WasmTypeList for (A,) {
             if let Some(data) = user_error {
                 Err(RuntimeError::Error { data })
             } else {
+                print_stack_trace(&*ctx, &trap);
                 Err(RuntimeError::Trap {
                     msg: trap.to_string().into(),
                 })
@@ -352,7 +418,7 @@ macro_rules! impl_traits {
                 let ( $( $x ),* ) = self;
                 let args = [ $( $x.to_native().to_binary()),* ];
                 let mut rets = Rets::empty_ret_array();
-                let mut trap = WasmTrapInfo::Unknown;
+                let mut trap = WasmTrapWrapper::default();
                 let mut user_error = None;
 
                 if (wasm.invoke)(wasm.trampoline, ctx, f, args.as_ptr(), rets.as_mut().as_mut_ptr(), &mut trap, &mut user_error, wasm.invoke_env) {
@@ -361,6 +427,7 @@ macro_rules! impl_traits {
                     if let Some(data) = user_error {
                         Err(RuntimeError::Error { data })
                     } else {
+                        print_stack_trace(&*ctx, &trap);
                         Err(RuntimeError::Trap { msg: trap.to_string().into() })
                     }
                 }

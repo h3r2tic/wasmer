@@ -11,7 +11,7 @@ use crate::{
     sig_registry::SigRegistry,
     structures::TypedIndex,
     table::Table,
-    typed_func::{Func, Wasm, WasmTrapInfo, WasmTypeList},
+    typed_func::{Func, Wasm, WasmTrapWrapper, WasmTypeList},
     types::{FuncIndex, FuncSig, GlobalIndex, LocalOrImport, MemoryIndex, TableIndex, Type, Value},
     vm::{self, InternalField},
 };
@@ -617,7 +617,7 @@ pub(crate) fn call_func_with_index_inner(
     } = wasm;
 
     let run_wasm = |result_space: *mut u64| unsafe {
-        let mut trap_info = WasmTrapInfo::Unknown;
+        let mut trap_info = WasmTrapWrapper::default();
         let mut user_error = None;
 
         let success = invoke(
@@ -637,6 +637,7 @@ pub(crate) fn call_func_with_index_inner(
             if let Some(data) = user_error {
                 Err(RuntimeError::Error { data })
             } else {
+                dbg!();
                 Err(RuntimeError::Trap {
                     msg: trap_info.to_string().into(),
                 })

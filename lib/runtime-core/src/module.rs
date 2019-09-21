@@ -12,6 +12,7 @@ use crate::{
     },
     Instance,
 };
+use wasmparser::{CustomSectionKind, NameSectionReader, Naming, NamingReader};
 
 use crate::backend::CacheGen;
 use indexmap::IndexMap;
@@ -58,6 +59,47 @@ pub struct ModuleInfo {
     pub em_symbol_map: Option<HashMap<u32, String>>,
 
     pub custom_sections: HashMap<String, Vec<u8>>,
+    pub function_names: HashMap<FuncIndex, String>,
+}
+
+fn parse_name_section<'data>(mut names: NameSectionReader<'data>) -> HashMap<FuncIndex, String> {
+    let name_subsection_iter = std::iter::from_fn(|| names.read().ok());
+
+    let func_name_iter = name_subsection_iter.filter_map(|subsection| {
+        if let wasmparser::Name::Function(function_subsection) = subsection {
+            function_subsection
+                .get_map()
+                .ok()
+                .and_then(parse_function_name_subsection)
+        } else {
+            None
+        }
+    });
+
+    func_name_iter.fold(HashMap::new(), |mut acc, names| {
+        acc.extend(names.into_iter());
+        acc
+    })
+}
+
+// Copy-pasta from cranelift, changing &str to String
+fn parse_function_name_subsection<'data>(
+    mut naming_reader: NamingReader<'data>,
+) -> Option<HashMap<FuncIndex, String>> {
+    let mut function_names = HashMap::new();
+    for _ in 0..naming_reader.get_count() {
+        let Naming { index, name } = naming_reader.read().ok()?;
+        if function_names
+            .insert(FuncIndex::new(index as usize), name.to_owned())
+            .is_some()
+        {
+            // If the function index has been previously seen, then we
+            // break out of the loop and early return `None`, because these
+            // should be unique.
+            return None;
+        }
+    }
+    return Some(function_names);
 }
 
 impl ModuleInfo {
@@ -65,13 +107,20 @@ impl ModuleInfo {
         let mut parser = wasmparser::ModuleReader::new(wasm)?;
         while !parser.eof() {
             let section = parser.read()?;
-            if let wasmparser::SectionCode::Custom { name, kind: _ } = section.code {
-                let mut reader = section.get_binary_reader();
-                let len = reader.bytes_remaining();
-                let bytes = reader.read_bytes(len)?;
-                let data = bytes.to_vec();
-                let name = name.to_string();
-                self.custom_sections.insert(name, data);
+
+            if let wasmparser::SectionCode::Custom { name, kind } = section.code {
+                if kind == CustomSectionKind::Name {
+                    let names = section.get_name_section_reader()?;
+                    let names = parse_name_section(names);
+                    self.function_names = names;
+                } else {
+                    let mut reader = section.get_binary_reader();
+                    let len = reader.bytes_remaining();
+                    let bytes = reader.read_bytes(len)?;
+                    let data = bytes.to_vec();
+                    let name = name.to_string();
+                    self.custom_sections.insert(name, data);
+                }
             }
         }
         Ok(())

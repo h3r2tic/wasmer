@@ -83,6 +83,7 @@ pub fn read_module<
         em_symbol_map: compiler_config.symbol_map.clone(),
 
         custom_sections: HashMap::new(),
+        function_names: HashMap::new(),
     }));
 
     let mut parser = wasmparser::ValidatingParser::new(

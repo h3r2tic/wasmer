@@ -18,7 +18,9 @@ use nix::sys::signal::{
 use std::cell::{Cell, UnsafeCell};
 use std::ptr;
 use std::sync::Once;
-use wasmer_runtime_core::typed_func::WasmTrapInfo;
+use wasmer_runtime_core::typed_func::{
+    StackTrace, WasmTrapInfo, WasmTrapWrapper, STACK_TRACE_SIZE,
+};
 
 extern "C" fn signal_trap_handler(
     signum: ::nix::libc::c_int,
@@ -54,6 +56,7 @@ thread_local! {
     pub static SETJMP_BUFFER: UnsafeCell<[c_int; SETJMP_BUFFER_LEN]> = UnsafeCell::new([0; SETJMP_BUFFER_LEN]);
     pub static CAUGHT_ADDRESSES: Cell<(*const c_void, *const c_void)> = Cell::new((ptr::null(), ptr::null()));
     pub static CURRENT_EXECUTABLE_BUFFER: Cell<*const c_void> = Cell::new(ptr::null());
+    pub static CAUGHT_STACK_TRACE: Cell<StackTrace> = Cell::new([0; STACK_TRACE_SIZE]);
 }
 
 pub unsafe fn trigger_trap() -> ! {
@@ -82,13 +85,14 @@ pub fn call_protected<T>(
                 Err(CallProtError::Error(data))
             } else {
                 let (faulting_addr, inst_ptr) = CAUGHT_ADDRESSES.with(|cell| cell.get());
+                let stack_trace = CAUGHT_STACK_TRACE.with(|cell| cell.get());
 
                 if let Some(TrapData {
                     trapcode,
                     srcloc: _,
                 }) = handler_data.lookup(inst_ptr)
                 {
-                    Err(CallProtError::Trap(match Signal::from_c_int(signum) {
+                    let info = match Signal::from_c_int(signum) {
                         Ok(SIGILL) => match trapcode {
                             TrapCode::BadSignature => WasmTrapInfo::IncorrectCallIndirectSignature,
                             TrapCode::IndirectCallToNull => WasmTrapInfo::CallIndirectOOB,
@@ -99,6 +103,11 @@ pub fn call_protected<T>(
                         Ok(SIGSEGV) | Ok(SIGBUS) => WasmTrapInfo::MemoryOutOfBounds,
                         Ok(SIGFPE) => WasmTrapInfo::IllegalArithmetic,
                         _ => unimplemented!(),
+                    };
+
+                    Err(CallProtError::Trap(WasmTrapWrapper {
+                        info,
+                        stack_trace: Some(stack_trace),
                     }))
                 } else {
                     let signal = match Signal::from_c_int(signum) {
@@ -122,6 +131,26 @@ pub fn call_protected<T>(
     }
 }
 
+fn capture_stack_trace(stack_top: *const c_void) {
+    unsafe {
+        let mut base_pointer = stack_top as *const usize;
+        let mut st: StackTrace = [0; STACK_TRACE_SIZE];
+
+        let mut depth = 0;
+
+        // Based on https://techno-coder.github.io/example_os/2018/06/04/A-stack-trace-for-your-OS.html
+        while base_pointer != std::ptr::null() && depth < STACK_TRACE_SIZE {
+            let return_address = *(base_pointer.offset(1)) as usize;
+            base_pointer = (*base_pointer) as *const usize;
+
+            st[depth] = return_address;
+            depth += 1;
+        }
+
+        CAUGHT_STACK_TRACE.with(|cell| cell.set(st));
+    }
+}
+
 /// Unwinds to last protected_call.
 pub unsafe fn do_unwind(signum: i32, siginfo: *const c_void, ucontext: *const c_void) -> ! {
     // Since do_unwind is only expected to get called from WebAssembly code which doesn't hold any host resources (locks etc.)
@@ -133,7 +162,10 @@ pub unsafe fn do_unwind(signum: i32, siginfo: *const c_void, ucontext: *const c_
         ::std::process::abort();
     }
 
-    CAUGHT_ADDRESSES.with(|cell| cell.set(get_faulting_addr_and_ip(siginfo, ucontext)));
+    let (faulting_addr, inst_ptr, stack_top) = get_faulting_addr_and_ip(siginfo, ucontext);
+    CAUGHT_ADDRESSES.with(|cell| cell.set((faulting_addr, inst_ptr)));
+
+    capture_stack_trace(stack_top);
 
     longjmp(jmp_buf as *mut ::nix::libc::c_void, signum)
 }
@@ -142,15 +174,15 @@ pub unsafe fn do_unwind(signum: i32, siginfo: *const c_void, ucontext: *const c_
 unsafe fn get_faulting_addr_and_ip(
     _siginfo: *const c_void,
     _ucontext: *const c_void,
-) -> (*const c_void, *const c_void) {
-    (::std::ptr::null(), ::std::ptr::null())
+) -> (*const c_void, *const c_void, *const c_void) {
+    (::std::ptr::null(), ::std::ptr::null(), ::std::ptr::null())
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn get_faulting_addr_and_ip(
     siginfo: *const c_void,
     ucontext: *const c_void,
-) -> (*const c_void, *const c_void) {
+) -> (*const c_void, *const c_void, *const c_void) {
     use libc::{ucontext_t, RIP};
 
     #[allow(dead_code)]
@@ -168,15 +200,16 @@ unsafe fn get_faulting_addr_and_ip(
 
     let ucontext = ucontext as *const ucontext_t;
     let rip = (*ucontext).uc_mcontext.gregs[RIP as usize];
+    let rbp = (*ucontext).uc_mcontext.gregs[libc::REG_RBP as usize];
 
-    (si_addr as _, rip as _)
+    (si_addr as _, rip as _, rbp as _)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 unsafe fn get_faulting_addr_and_ip(
     siginfo: *const c_void,
     ucontext: *const c_void,
-) -> (*const c_void, *const c_void) {
+) -> (*const c_void, *const c_void, *const c_void) {
     #[allow(dead_code)]
     #[repr(C)]
     struct ucontext_t {
@@ -231,8 +264,9 @@ unsafe fn get_faulting_addr_and_ip(
 
     let ucontext = ucontext as *const ucontext_t;
     let rip = (*(*ucontext).uc_mcontext).ss.rip;
+    let rbp = (*(*ucontext).uc_mcontext).ss.rbp;
 
-    (si_addr, rip as _)
+    (si_addr, rip as _, rbp as _)
 }
 
 #[cfg(not(any(

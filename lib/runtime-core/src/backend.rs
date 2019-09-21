@@ -175,6 +175,10 @@ pub trait RunnableModule: Send + Sync {
         None
     }
 
+    fn get_code_end_ptr(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns the beginning offsets of all functions, including import trampolines.
     fn get_offsets(&self) -> Option<Vec<usize>> {
         None

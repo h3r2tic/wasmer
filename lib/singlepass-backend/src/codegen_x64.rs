@@ -269,7 +269,7 @@ impl RunnableModule for X64ExecutionContext {
             func: NonNull<vm::Func>,
             args: *const u64,
             rets: *mut u64,
-            trap_info: *mut WasmTrapInfo,
+            trap_info: *mut WasmTrapWrapper,
             user_error: *mut Option<Box<dyn Any>>,
             num_params_plus_one: Option<NonNull<c_void>>,
         ) -> bool {

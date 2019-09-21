@@ -6,7 +6,7 @@ use std::{any::Any, cell::Cell, ptr::NonNull, sync::Arc};
 use wasmer_runtime_core::{
     backend::RunnableModule,
     module::ModuleInfo,
-    typed_func::{Wasm, WasmTrapInfo},
+    typed_func::{Wasm, WasmTrapWrapper},
     types::{LocalFuncIndex, SigIndex},
     vm,
 };
@@ -28,7 +28,7 @@ thread_local! {
 }
 
 pub enum CallProtError {
-    Trap(WasmTrapInfo),
+    Trap(WasmTrapWrapper),
     Error(Box<dyn Any>),
 }
 
@@ -64,7 +64,7 @@ impl RunnableModule for Caller {
             func: NonNull<vm::Func>,
             args: *const u64,
             rets: *mut u64,
-            trap_info: *mut WasmTrapInfo,
+            trap_info: *mut WasmTrapWrapper,
             user_error: *mut Option<Box<dyn Any>>,
             invoke_env: Option<NonNull<c_void>>,
         ) -> bool {
@@ -104,6 +104,10 @@ impl RunnableModule for Caller {
                 Some(NonNull::from(&self.handler_data).cast()),
             )
         })
+    }
+
+    fn get_code_end_ptr(&self) -> Option<usize> {
+        Some(self.resolver.memory.as_ptr() as usize + self.resolver.memory.size())
     }
 
     unsafe fn do_early_trap(&self, data: Box<dyn Any>) -> ! {
